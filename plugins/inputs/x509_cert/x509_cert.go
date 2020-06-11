@@ -10,6 +10,8 @@ import (
 	"io/ioutil"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -102,28 +104,55 @@ func (c *X509Cert) getCert(u *url.URL, timeout time.Duration) ([]*x509.Certifica
 
 		return certs, nil
 	case "file":
-		content, err := ioutil.ReadFile(u.Path)
+		matches, err := filepath.Glob(u.Path)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("Malformed pattern error: %v %v\n", err, u.Path)
 		}
-		var certs []*x509.Certificate
-		for {
-			block, rest := pem.Decode(bytes.TrimSpace(content))
-			if block == nil {
-				return nil, fmt.Errorf("failed to parse certificate PEM")
-			}
 
-			if block.Type == "CERTIFICATE" {
-				cert, err := x509.ParseCertificate(block.Bytes)
+		if len(matches) == 0 {
+			return nil, fmt.Errorf("No files found for pattern: %v\n", u.Path)
+		}
+
+		var certs []*x509.Certificate
+
+		for _, match := range matches {
+			err := filepath.Walk(match, func(path string, info os.FileInfo,
+				err error) error {
 				if err != nil {
-					return nil, err
+					return err
 				}
-				certs = append(certs, cert)
+				if !info.IsDir() && filepath.Ext(path) == ".pem" {
+					content, rerr := ioutil.ReadFile(path)
+					if rerr != nil {
+						return rerr
+					}
+
+					for {
+						block, rest := pem.Decode(bytes.TrimSpace(content))
+						if block == nil {
+							return fmt.Errorf("failed to parse certificate PEM")
+						}
+
+						if block.Type == "CERTIFICATE" {
+							cert, err := x509.ParseCertificate(block.Bytes)
+							if err != nil {
+								return err
+							}
+							certs = append(certs, cert)
+						}
+						if rest == nil || len(rest) == 0 {
+							break
+						}
+						content = rest
+					}
+				}
+
+				return nil
+			})
+
+			if err != nil {
+				return nil, err
 			}
-			if rest == nil || len(rest) == 0 {
-				break
-			}
-			content = rest
 		}
 		return certs, nil
 	default:
