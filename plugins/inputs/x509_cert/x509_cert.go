@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/influxdata/telegraf/internal"
 	_tls "github.com/influxdata/telegraf/internal/tls"
 	"github.com/influxdata/telegraf/plugins/inputs"
+	pfx "software.sslmate.com/src/go-pkcs12"
 )
 
 const sampleConfig = `
@@ -39,11 +41,16 @@ const description = "Reads metrics from a SSL certificate"
 
 // X509Cert holds the configuration of the plugin.
 type X509Cert struct {
-	Sources    []string          `toml:"sources"`
+	Sources    []SourcesConfig   `toml:"sources"`
 	Timeout    internal.Duration `toml:"timeout"`
 	ServerName string            `toml:"server_name"`
 	tlsCfg     *tls.Config
 	_tls.ClientConfig
+}
+
+type SourcesConfig struct {
+	Path     string `toml:"path"`
+	Password string `toml:"password"`
 }
 
 // Description returns description of the plugin.
@@ -69,7 +76,7 @@ func (c *X509Cert) locationToURL(location string) (*url.URL, error) {
 	return u, nil
 }
 
-func (c *X509Cert) getCert(u *url.URL, timeout time.Duration) ([]*x509.Certificate, error) {
+func (c *X509Cert) getCert(u *url.URL, password string, timeout time.Duration) ([]*x509.Certificate, error) {
 	switch u.Scheme {
 	case "https":
 		u.Scheme = "tcp"
@@ -107,23 +114,32 @@ func (c *X509Cert) getCert(u *url.URL, timeout time.Duration) ([]*x509.Certifica
 			return nil, err
 		}
 		var certs []*x509.Certificate
-		for {
-			block, rest := pem.Decode(bytes.TrimSpace(content))
-			if block == nil {
-				return nil, fmt.Errorf("failed to parse certificate PEM")
-			}
-
-			if block.Type == "CERTIFICATE" {
-				cert, err := x509.ParseCertificate(block.Bytes)
-				if err != nil {
-					return nil, err
+		if filepath.Ext(u.Path) == ".pem" {
+			for {
+				block, rest := pem.Decode(bytes.TrimSpace(content))
+				if block == nil {
+					return nil, fmt.Errorf("failed to parse certificate PEM")
 				}
-				certs = append(certs, cert)
+
+				if block.Type == "CERTIFICATE" {
+					cert, err := x509.ParseCertificate(block.Bytes)
+					if err != nil {
+						return nil, err
+					}
+					certs = append(certs, cert)
+				}
+				if rest == nil || len(rest) == 0 {
+					break
+				}
+				content = rest
 			}
-			if rest == nil || len(rest) == 0 {
-				break
+		} else if filepath.Ext(u.Path) == ".pfx" {
+			_, cert, certChain, err := pfx.DecodeChain(content, password)
+			if err != nil {
+				return nil, err
 			}
-			content = rest
+			certs = append(certs, cert)
+			certs = append(certs, certChain...)
 		}
 		return certs, nil
 	default:
@@ -192,20 +208,20 @@ func (c *X509Cert) Gather(acc telegraf.Accumulator) error {
 	now := time.Now()
 
 	for _, location := range c.Sources {
-		u, err := c.locationToURL(location)
+		u, err := c.locationToURL(location.Path)
 		if err != nil {
 			acc.AddError(err)
 			return nil
 		}
 
-		certs, err := c.getCert(u, c.Timeout.Duration*time.Second)
+		certs, err := c.getCert(u, location.Password, c.Timeout.Duration*time.Second)
 		if err != nil {
 			acc.AddError(fmt.Errorf("cannot get SSL cert '%s': %s", location, err.Error()))
 		}
 
 		for i, cert := range certs {
 			fields := getFields(cert, now)
-			tags := getTags(cert, location)
+			tags := getTags(cert, location.Path)
 
 			// The first certificate is the leaf/end-entity certificate which needs DNS
 			// name validation against the URL hostname.
@@ -262,7 +278,7 @@ func (c *X509Cert) Init() error {
 func init() {
 	inputs.Add("x509_cert", func() telegraf.Input {
 		return &X509Cert{
-			Sources: []string{},
+			Sources: []SourcesConfig{},
 			Timeout: internal.Duration{Duration: 5},
 		}
 	})
